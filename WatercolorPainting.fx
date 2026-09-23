@@ -21,6 +21,13 @@ uniform int ToneSteps <
 	ui_tooltip = "Number of flat color bands, like mixed pigment layers.";
 > = 9;
 
+uniform float PosterizeSoftness <
+	ui_type = "slider";
+	ui_label = "Posterize Softness";
+	ui_min = 0.0; ui_max = 0.5;
+	ui_tooltip = "Feathers the boundary between tone bands instead of a hard step.";
+> = 0.25;
+
 uniform float EdgeDarken <
 	ui_type = "slider";
 	ui_label = "Edge Pigment Pooling";
@@ -188,14 +195,27 @@ float HueLerp(float a, float b, float t)
 	return frac(a + delta * t);
 }
 
-// Blends large/medium/small offset hash layers so pigment separation reads as irregular blotches, not square cells.
+// Smooth (bilinearly interpolated) hash noise so pigment regions blend into each other instead of snapping at grid cell borders.
+float ValueNoise(float2 uv)
+{
+	float2 i = floor(uv);
+	float2 f = frac(uv);
+	float a = Hash12(i);
+	float b = Hash12(i + float2(1.0, 0.0));
+	float c = Hash12(i + float2(0.0, 1.0));
+	float d = Hash12(i + float2(1.0, 1.0));
+	float2 u = f * f * (3.0 - 2.0 * f);
+	return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+// Blends large/medium/small smooth noise octaves so pigment separation reads as soft, irregular blotches.
 float PigmentPattern(float2 texcoord)
 {
 	float2 uv = texcoord * BUFFER_WIDTH / max(HiddenColorScale, 1.0);
-	float largeA = Hash12(floor(uv));
-	float largeB = Hash12(floor(uv * 0.73 + 17.0));
-	float medium = Hash12(floor(uv * 1.8 + 41.0));
-	float small = Hash12(floor(uv * 4.0 + 83.0));
+	float largeA = ValueNoise(uv);
+	float largeB = ValueNoise(uv * 0.73 + 17.0);
+	float medium = ValueNoise(uv * 1.8 + 41.0);
+	float small = ValueNoise(uv * 4.0 + 83.0);
 	float large = lerp(largeA, largeB, 0.35);
 	return saturate(large * 0.55 + medium * 0.30 + small * 0.15);
 }
@@ -219,10 +239,14 @@ float3 WatercolorBlurPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) : 
 
 float3 WatercolorPaintPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
-	float3 painted = tex2D(WatercolorBlurSampler, texcoord).rgb;
+	float3 blurred = tex2D(WatercolorBlurSampler, texcoord).rgb;
 
-	// Posterize into discrete pigment bands.
-	painted = round(painted * ToneSteps) / ToneSteps;
+	// Soft posterize: feather the step edge between bands instead of a hard round().
+	float3 bands = blurred * ToneSteps;
+	float3 bandFloor = floor(bands);
+	float3 bandFrac = bands - bandFloor;
+	float3 bandT = smoothstep(0.5 - PosterizeSoftness, 0.5 + PosterizeSoftness, bandFrac);
+	float3 painted = (bandFloor + bandT) / ToneSteps;
 
 	// Estimate local contrast from the sharp image to find contours.
 	float2 px = ReShade::PixelSize;
@@ -237,8 +261,9 @@ float3 WatercolorPaintPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) :
 	float baseSat = hsv.y;
 	float baseValue = hsv.z;
 
-	// Where this pixel sits between the Shadow and Light thresholds (0 = shadow, 1 = light).
-	float luma = dot(painted, float3(0.299, 0.587, 0.114));
+	// Use the pre-posterize luma so the hue/saturation/value trajectory stays continuous
+	// instead of inheriting the tone band's stair-steps.
+	float luma = dot(blurred, float3(0.299, 0.587, 0.114));
 
 	// Continuous Shadow -> Mid -> Light hue/saturation/value trajectory, instead of a hard zone switch.
 	float shadowHue = frac(baseHue + ShadowHueShift / 360.0);
