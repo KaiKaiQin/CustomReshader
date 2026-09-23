@@ -1,11 +1,18 @@
 ////////////////////////////////////////////////////////
-// ComplementaryColours
+// ComplementaryColours (V4)
 // Original shader: simulates a hand-painted watercolor look
 // by softening detail, posterizing tones and darkening edges
 // like pooled pigment along contours. The hidden-color tint
 // follows a continuous Shadow -> Mid -> Light hue trajectory
 // using complementary/analogous hue shifts instead of
 // hard-switching between three fixed colors.
+//
+// V4 adds a shared environmental color atmosphere (sampled from
+// a wide blur) and small local complementary-hue color accents
+// on top of the per-pixel hue/sat/value trajectory.
+//
+// Local Base Color -> Light/Mid/Shadow Trajectory
+//   -> + Environmental Color -> + Small Color Accents -> Final
 ////////////////////////////////////////////////////////
 
 uniform float SmoothRadius <
@@ -158,10 +165,49 @@ uniform float StructureInfluence <
 	ui_tooltip = "Makes hidden color stronger around local form changes.";
 > = 0.35;
 
+uniform float EnvironmentColorStrength <
+	ui_type = "slider";
+	ui_label = "Environment Color Strength";
+	ui_min = 0.0; ui_max = 1.0;
+	ui_tooltip = "How strongly the surrounding color atmosphere influences each pixel.";
+> = 0.20;
+
+uniform float EnvironmentColorRadius <
+	ui_type = "slider";
+	ui_label = "Environment Color Radius";
+	ui_min = 2.0; ui_max = 16.0;
+	ui_tooltip = "Spatial scale used to estimate the surrounding color atmosphere.";
+> = 7.0;
+
+uniform float EnvironmentShadowBias <
+	ui_type = "slider";
+	ui_label = "Shadow Environment Bias";
+	ui_min = 0.0; ui_max = 1.0;
+	ui_tooltip = "Makes environmental color stronger toward shadow areas.";
+> = 0.65;
+
+uniform float AccentStrength <
+	ui_type = "slider";
+	ui_label = "Complementary Color Accent";
+	ui_min = 0.0; ui_max = 1.0;
+	ui_tooltip = "Small amount of complementary pigment variation.";
+> = 0.10;
+
+uniform float AccentVariation <
+	ui_type = "slider";
+	ui_label = "Accent Variation";
+	ui_min = 0.0; ui_max = 60.0;
+	ui_tooltip = "Hue variation around the complementary accent.";
+> = 25.0;
+
 #include "ReShade.fxh"
 
 texture WatercolorBlurTex { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
 sampler WatercolorBlurSampler { Texture = WatercolorBlurTex; };
+
+// Wide-radius atmosphere buffer: not meant to look blurred, just to estimate the color surrounding each pixel.
+texture WatercolorAtmosphereTex { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
+sampler WatercolorAtmosphereSampler { Texture = WatercolorAtmosphereTex; };
 
 float Hash12(float2 p)
 {
@@ -225,6 +271,23 @@ float PigmentPattern(float2 texcoord)
 float3 WatercolorBlurPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
 	float2 px = ReShade::PixelSize * SmoothRadius;
+	float3 sum = 0.0;
+	sum += tex2D(ReShade::BackBuffer, texcoord).rgb * 4.0;
+	sum += tex2D(ReShade::BackBuffer, texcoord + float2(px.x, 0)).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord - float2(px.x, 0)).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord + float2(0, px.y)).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord - float2(0, px.y)).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord + px).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord - px).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord + float2(px.x, -px.y)).rgb;
+	sum += tex2D(ReShade::BackBuffer, texcoord + float2(-px.x, px.y)).rgb;
+	return sum / 12.0;
+}
+
+// Same 9-tap pattern as the local blur but at a much wider radius, to sample the color atmosphere around each pixel.
+float3 WatercolorAtmospherePS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+{
+	float2 px = ReShade::PixelSize * EnvironmentColorRadius;
 	float3 sum = 0.0;
 	sum += tex2D(ReShade::BackBuffer, texcoord).rgb * 4.0;
 	sum += tex2D(ReShade::BackBuffer, texcoord + float2(px.x, 0)).rgb;
@@ -305,6 +368,32 @@ float3 WatercolorPaintPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) :
 	float hiddenAmount = saturate(HiddenColorStrength * 0.12 * pigmentVisibility * structureVisibility);
 	painted = lerp(painted, hiddenColor, hiddenAmount);
 
+	// Environment color: a wide blur estimates the color atmosphere around this pixel, low-saturation
+	// (grayish) surroundings contribute little hue, and shadows lean on it more than highlights do.
+	float3 environmentHSV = RGBtoHSV(tex2D(WatercolorAtmosphereSampler, texcoord).rgb);
+	float environmentColorWeight = smoothstep(0.04, 0.25, environmentHSV.y);
+	float shadowAmount = 1.0 - smoothstep(ShadowZoneThreshold, 0.75, luma);
+	float environmentInfluence = EnvironmentColorStrength * environmentColorWeight
+		* lerp(1.0, 1.0 + EnvironmentShadowBias, shadowAmount);
+
+	float3 environmentHSVOut = targetHSV;
+	environmentHSVOut.x = HueLerp(targetHSV.x, environmentHSV.x, environmentInfluence);
+	// Environment color behaves like reflected/atmospheric pigment, so it slightly reduces purity.
+	environmentHSVOut.y = lerp(targetHSV.y, targetHSV.y * 0.82, environmentInfluence);
+	float3 environmentColor = HSVtoRGB(environmentHSVOut);
+	painted = lerp(painted, environmentColor, hiddenAmount * environmentInfluence);
+
+	// Local complementary accent: a small "surprise pigment" placed only in the densest pigment blotches.
+	float accentNoise = Hash12(floor(blotchUV * 1.7 + 71.0));
+	float accentHueJitter = (accentNoise - 0.5) * AccentVariation / 360.0;
+	float3 accentHSV = targetHSV;
+	accentHSV.x = frac(baseHue + 0.5 + accentHueJitter);
+	accentHSV.y = saturate(targetHSV.y * 1.15);
+	accentHSV.z = targetHSV.z * 0.95;
+	float3 accentColor = HSVtoRGB(accentHSV);
+	float accentMask = smoothstep(0.72, 0.92, patch);
+	painted = lerp(painted, accentColor, AccentStrength * accentMask * hiddenAmount);
+
 	float grain = (Hash12(texcoord * BUFFER_WIDTH) - 0.5) * PaperGrain;
 	painted = saturate(painted + grain);
 
@@ -321,6 +410,12 @@ technique ComplementaryColours <
 		VertexShader = PostProcessVS;
 		PixelShader = WatercolorBlurPS;
 		RenderTarget = WatercolorBlurTex;
+	}
+	pass Atmosphere
+	{
+		VertexShader = PostProcessVS;
+		PixelShader = WatercolorAtmospherePS;
+		RenderTarget = WatercolorAtmosphereTex;
 	}
 	pass Paint
 	{
