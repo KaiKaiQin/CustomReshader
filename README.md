@@ -2,7 +2,7 @@
 
 A small set of original ReShade/GShade `.fx` post-processing shaders, each exploring a different visual style.
 
-## WatercolorPainting.fx
+## ComplementaryColours.fx
 
 Simulates a hand-painted watercolor look through three layered techniques:
 

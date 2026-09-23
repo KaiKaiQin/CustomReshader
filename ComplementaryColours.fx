@@ -1,10 +1,11 @@
 ////////////////////////////////////////////////////////
-// WatercolorPainting
+// ComplementaryColours
 // Original shader: simulates a hand-painted watercolor look
 // by softening detail, posterizing tones and darkening edges
 // like pooled pigment along contours. The hidden-color tint
 // follows a continuous Shadow -> Mid -> Light hue trajectory
-// instead of hard-switching between three fixed colors.
+// using complementary/analogous hue shifts instead of
+// hard-switching between three fixed colors.
 ////////////////////////////////////////////////////////
 
 uniform float SmoothRadius <
@@ -310,7 +311,10 @@ float3 WatercolorPaintPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD) :
 	return painted;
 }
 
-technique WatercolorPainting
+technique ComplementaryColours <
+	ui_label = "Complementary Colours";
+	ui_tooltip = "Watercolor-style posterize/blur with a hidden complementary-hue color trajectory.";
+>
 {
 	pass Blur
 	{
